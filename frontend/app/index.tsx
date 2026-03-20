@@ -37,6 +37,7 @@ export default function Scanner() {
 
   const [permission, requestPermission] = useCameraPermissions();
   const [scannedUrl, setScannedUrl] = useState<string | null>(null);
+  const [scanResult, setScanResult] = useState<any>(null);
   const qrLock = useRef(false);
   const appState = useRef(AppState.currentState);
   const scanLineAnim = useRef(new Animated.Value(0)).current;
@@ -79,13 +80,23 @@ export default function Scanner() {
     outputRange: [0, 180],
   });
 
-  const handleScan = ({ data }: { data: string }) => {
+  const handleScan = async ({ data }: { data: string }) => {
     if (data && !qrLock.current) {
       qrLock.current = true;
       setScannedUrl(data);
-      // TODO: send to Cloudflare Worker for scoring
-    }
-  };
+      //send to Cloudflare Worker for scoring
+
+      try {
+        const response = await fetch(
+          `https://safescan-worker.tinenyashadev.workers.dev/?url=${encodeURIComponent(data)}`
+        );
+        const result = await response.json();
+        setScanResult(result);
+            } catch (err) {
+              setScanResult({ verdict: 'UNKNOWN', score: -1, cached: false, error: 'Failed to reach scanner backend' });
+            }
+          }
+        };
 
   if (!fontsLoaded) return <View style={styles.container} />;
 
@@ -105,7 +116,14 @@ export default function Scanner() {
       </View>
     );
   }
-
+  const getVerdictColor = (verdict?: string) => {
+    switch (verdict) {
+      case 'SAFE': return '#00e5ff';
+      case 'SUSPICIOUS': return '#ffab40';
+      case 'MALICIOUS': return '#ff4081';
+      default: return '#5a5580';
+    }
+  };
   return (
     <View style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
@@ -161,10 +179,12 @@ export default function Scanner() {
         </View>
         <View style={styles.resultBody}>
           <View style={styles.verdictRow}>
-            <Text style={styles.verdictScore}>—</Text>
+            <Text style={[styles.verdictScore, { color: getVerdictColor(scanResult?.verdict) }]}>
+              {scanResult ? scanResult.score : '—'}
+            </Text>
             <View style={styles.verdictInfo}>
-              <Text style={styles.verdictLabel}>
-                {scannedUrl ? 'ANALYZING...' : 'IDLE'}
+              <Text style={[styles.verdictLabel, { color: getVerdictColor(scanResult?.verdict) }]}>
+                {scanResult ? scanResult.verdict : scannedUrl ? 'ANALYZING...' : 'IDLE'}
               </Text>
               <Text style={styles.verdictSub}>THREAT SCORE / 100</Text>
             </View>
