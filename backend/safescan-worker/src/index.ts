@@ -11,127 +11,17 @@
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
-export interface Env {
-  SAFE_BROWSING_API_KEY: string;
-}
-
-interface ThreatMatch {
-  threatType: string;
-  platformType: string;
-  threatEntryType: string;
-  threat: { url: string };
-  cacheDuration?: string;
-}
-
-interface SafeBrowsingResponse {
-  matches?: ThreatMatch[];
-  negativeCacheDuration?: string;
-}
-
-interface ScanResult {
-  verdict: 'SAFE' | 'SUSPICIOUS' | 'MALICIOUS' | 'UNKNOWN';
-  score: number;
-  cached: boolean;
-  threats?: string[];
-  cacheTtl?: number;
-  error?: string;
-}
-
-// Parse Google's duration format "300.000s" → number of seconds
-function parseDuration(duration?: string, fallback = 300): number {
-  if (!duration) return fallback;
-  return Math.floor(parseFloat(duration.replace('s', '')));
-}
-
-async function checkSafeBrowsing(
-  url: string,
-  apiKey: string
-): Promise<{ result: ScanResult; ttl: number }> {
-  let response: Response;
-
-  try {
-    response = await fetch(
-      `https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client: {
-            clientId: 'safescan-app',
-            clientVersion: '1.0.0',
-          },
-          threatInfo: {
-            threatTypes: [
-              'MALWARE',
-              'SOCIAL_ENGINEERING',
-              'UNWANTED_SOFTWARE',
-              'POTENTIALLY_HARMFUL_APPLICATION',
-            ],
-            platformTypes: ['ANY_PLATFORM'],
-            threatEntryTypes: ['URL'],
-            threatEntries: [{ url }],
-          },
-        }),
-      }
-    );
-  } catch (err) {
-    // Network error — never cache
-    return {
-      result: {
-        verdict: 'UNKNOWN',
-        score: -1,
-        cached: false,
-        error: 'Network error reaching Safe Browsing API',
-      },
-      ttl: 0,
-    };
-  }
-
-  if (!response.ok) {
-    // API error — never cache
-    return {
-      result: {
-        verdict: 'UNKNOWN',
-        score: -1,
-        cached: false,
-        error: `Safe Browsing API returned status ${response.status}`,
-      },
-      ttl: 0,
-    };
-  }
-
-  const data = (await response.json()) as SafeBrowsingResponse;
-  const matches = data.matches ?? [];
-
-  if (matches.length === 0) {
-    // Safe — use negativeCacheDuration from response per Google's spec
-    const ttl = parseDuration(data.negativeCacheDuration, 300);
-    return {
-      result: {
-        verdict: 'SAFE',
-        score: 10,
-        cached: false,
-        cacheTtl: ttl,
-      },
-      ttl,
-    };
-  }
-
-  // Malicious — use cacheDuration from first match per Google's spec
-  const ttl = parseDuration(matches[0].cacheDuration, 300);
-  const threatTypes = matches.map((m) => m.threatType);
-
-  return {
-    result: {
-      verdict: 'MALICIOUS',
-      score: 90,
-      cached: false,
-      threats: threatTypes,
-      cacheTtl: ttl,
-    },
-    ttl,
-  };
-}
+import { getCached, setCached } from './utils/cache';
+import { aggregateResults } from './utils/scorer';
+import { checkHeuristics } from './checks/heuristics';
+import { checkTyposquatting } from './checks/typosquatting';
+import { checkMlScoring } from './checks/mlScoring';
+import { checkReputation } from './checks/reputation';
+import { checkRedirects } from './checks/redirects';
+import { checkDomainAge } from './checks/domainAge';
+import { checkDeepScan } from './checks/deepScan';
+import { checkRateLimit } from './utils/rateLimiter';
+import type { Env, AggregatedResult, CheckResult, ScanResult } from './utils/types';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -168,50 +58,85 @@ export default {
       );
     }
 
-    // Build cache key from target URL
-    const cacheKey = new Request(
-      `https://safescan-cache.internal/${encodeURIComponent(targetUrl)}`
-    );
-    const cache = caches.default;
-
-    // Check cache first
-    const cachedResponse = await cache.match(cacheKey);
-    if (cachedResponse) {
-      const cachedData = (await cachedResponse.json()) as ScanResult;
-      cachedData.cached = true;
-      return new Response(JSON.stringify(cachedData), {
-        headers: {
-          ...corsHeaders,
-          'Content-Type': 'application/json',
-          'X-Cache': 'HIT',
-        },
+    // Rate limiting (stub)
+    const ip = request.headers.get('CF-Connecting-IP') ?? '';
+    const allowed = await checkRateLimit(ip, env as unknown as Env);
+    if (!allowed) {
+      return new Response(JSON.stringify({ error: 'Rate limit exceeded' }), {
+        status: 429,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    // Cache miss — call Safe Browsing API
-    const { result, ttl } = await checkSafeBrowsing(
-      targetUrl,
-      env.SAFE_BROWSING_API_KEY
-    );
+    // Check cache (legacy ScanResult shape)
+    const cached = await getCached(targetUrl);
+    if (cached) {
+      // Wrap cached ScanResult into AggregatedResult-like response
+      const cachedCheck: CheckResult = {
+        checkName: 'reputation',
+        threatLevel: cached.verdict === 'SAFE' ? 'safe' : cached.verdict === 'MALICIOUS' ? 'malicious' : cached.verdict === 'SUSPICIOUS' ? 'suspicious' : 'unknown',
+        score: cached.score,
+        detail: cached.error ?? cached.threats?.join(',') ?? undefined,
+      };
 
-    // Only cache real results — never cache UNKNOWN (errors)
-    if (result.verdict !== 'UNKNOWN' && ttl > 0) {
-      const responseToCache = new Response(JSON.stringify(result), {
-        headers: {
-          'Content-Type': 'application/json',
-          // TTL comes directly from Google's API response per their caching spec
-          'Cache-Control': `public, max-age=${ttl}`,
-        },
+      const agg: AggregatedResult = {
+        url: targetUrl,
+        finalVerdict: cachedCheck.threatLevel,
+        score: cached.score,
+        checks: [cachedCheck],
+        scannedAt: new Date().toISOString(),
+      };
+
+      return new Response(JSON.stringify(agg), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json', 'X-Cache': 'HIT' },
       });
-      await cache.put(cacheKey, responseToCache);
     }
 
-    return new Response(JSON.stringify(result), {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'application/json',
-        'X-Cache': 'MISS',
-      },
+    // Tier 1 checks (in-worker)
+    const tier1 = await Promise.all([
+      checkHeuristics(targetUrl, env as unknown as Env),
+      checkTyposquatting(targetUrl, env as unknown as Env),
+      checkMlScoring(targetUrl, env as unknown as Env),
+    ]);
+
+    // Tier 2 checks (external)
+    const reputationRes = await checkReputation(targetUrl, env as unknown as Env);
+    const tier2 = await Promise.all([
+      Promise.resolve(reputationRes.checkResult),
+      checkRedirects(targetUrl, env as unknown as Env),
+      checkDomainAge(targetUrl, env as unknown as Env),
+    ]);
+
+    // Kick off tier 3 (async) and don't wait
+    // deep scan will be scheduled via ctx.waitUntil
+
+    // Aggregate all check results
+    const allChecks: CheckResult[] = [...tier1, ...tier2];
+    const aggScore = aggregateResults(allChecks);
+
+    const aggregated: AggregatedResult = {
+      url: targetUrl,
+      finalVerdict: aggScore.verdict as any,
+      score: aggScore.score,
+      checks: allChecks,
+      scannedAt: new Date().toISOString(),
+    };
+
+    // Cache reputation (legacy behavior)
+    const ttl = reputationRes.ttl ?? 0;
+    if (reputationRes.checkResult.threatLevel !== 'unknown' && ttl > 0) {
+      const scanResult: ScanResult = {
+        verdict: reputationRes.checkResult.threatLevel === 'safe' ? 'SAFE' : reputationRes.checkResult.threatLevel === 'malicious' ? 'MALICIOUS' : reputationRes.checkResult.threatLevel === 'suspicious' ? 'SUSPICIOUS' : 'UNKNOWN',
+        score: reputationRes.checkResult.score,
+        cached: false,
+        threats: reputationRes.checkResult.detail ? [reputationRes.checkResult.detail] : undefined,
+        cacheTtl: ttl,
+      };
+      await setCached(targetUrl, scanResult, ttl);
+    }
+
+    return new Response(JSON.stringify(aggregated), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json', 'X-Cache': 'MISS' },
     });
   },
 } satisfies ExportedHandler<Env>;
