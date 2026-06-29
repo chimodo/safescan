@@ -5,6 +5,7 @@ import { CheckResult } from '../utils/types';
 // Tier 2 (external API, 200-400ms)
 // checkReputation queries Google Safe Browsing and maps result to CheckResult
 // TODO: preserve behavior exactly from previous implementation
+// ttl (time to live) id how long we can trust the chached result.
 export async function checkReputation(url: string, env: Env): Promise<{ checkResult: CheckResult; ttl: number }> {
   let response: Response;
 
@@ -83,3 +84,45 @@ export async function checkReputation(url: string, env: Env): Promise<{ checkRes
     ttl,
   };
 }
+
+
+/**
+ * ~ Api Guide for reference from documentation ~
+ * 
+ * use the request body as below.
+ * if threat matches are found, it returns an object with a list of threat objects (refer to the example response) 
+ * Note, no matches found returns {}
+ * Google Safe Browsing API v4 — threatMatches.find
+ * POST https://safebrowsing.googleapis.com/v4/threatMatches:find?key=API_KEY
+ *
+ * Request body:
+ * {
+ *   "client": { "clientId": string, "clientVersion": string },
+ *   "threatInfo": {
+ *     "threatTypes": string[],       // e.g. "MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"
+ *     "platformTypes": string[],     // e.g. "ANY_PLATFORM"
+ *     "threatEntryTypes": string[],  // e.g. "URL"
+ *     "threatEntries": [{ "url": string }]
+ *   }
+ * }
+ *
+ * Response body — NO matches found:
+ * {}                                 // <- empty object, NOT { "matches": [] }
+ *
+ * Response body — matches found:
+ * {
+ *   "matches": [
+ *     {
+ *       "threatType": string,            // e.g. "MALWARE"
+ *       "platformType": string,          // e.g. "ANY_PLATFORM"
+ *       "threat": { "url": string },
+ *       "cacheDuration": string,         // e.g. "300s"
+ *       "threatEntryType": string,       // e.g. "URL"
+ *       "threatEntryMetadata"?: { ... }  // optional, only for some threat types
+ *     }
+ *   ]
+ * }
+ *
+ * NOTE: data.matches can be `undefined` when there's no match (API omits the
+ * field entirely), so always read it with `data.matches ?? []`.
+ */
